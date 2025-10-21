@@ -1,7 +1,7 @@
 feedparser
-python-telegram-bot>=20 # Use latest async version
+python-telegram-bot>=20
 APScheduler
 Flask
 waitress
 requests
-httpx # Required by newer python-telegram-bot
+httpx
