@@ -1,7 +1,5 @@
 feedparser
-python-telegram-bot>=20
+python-telegram-bot
 APScheduler
 Flask
 waitress
-requests
-httpx
