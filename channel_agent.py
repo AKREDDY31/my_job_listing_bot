@@ -3,10 +3,13 @@ import threading
 import time
 import schedule
 import logging
-import os  # ### NEW ### - For environment variables
-import requests  # ### NEW ### - For Unstop API
-
+import os
+import requests
 from datetime import datetime
+from threading import Thread
+
+# --- NEW: Imports for Web Server ---
+from flask import Flask
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -14,22 +17,25 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
 
 import telegram
 
 # --- 1. CONFIGURATION ---
-# ### UPDATED ###
-# Tokens are now read from Render's Environment Variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-DB_NAME = "jobs.db"
+# ### UPDATED: Point to Render's persistent disk
+DB_NAME = "/data/jobs.db"  
+
 JOBRAPIDO_URL = "https://in.jobrapido.com/Jobs-in-India?q=job"
-UNSTOP_API_URL = "https://unstop.com/api/public/opportunity/search-result"  # ### NEW ###
+UNSTOP_API_URL = "https://unstop.com/api/public/opportunity/search-result"
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- NEW: Flask Web Server (for Uptime Robot) ---
+app = Flask(__name__)
 
 # --- 2. DATABASE SETUP ---
 def setup_database():
@@ -39,7 +45,7 @@ def setup_database():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_link TEXT UNIQUE,  -- UNIQUE prevents duplicate jobs
+        job_link TEXT UNIQUE,
         job_title TEXT,
         company_name TEXT,
         scraped_at TIMESTAMP,
@@ -59,19 +65,25 @@ def scrape_jobrapido_task():
     """
     logging.info("[SCRAPER-Jobrapido] Starting new job scrape...")
     
-    # --- Setup Selenium ---
     service = Service(ChromeDriverManager().install())
-    options = webdriver.ChromeOptions()
+    
+    # ### UPDATED: Add all options for Render/Buildpack
+    options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
     
+    # ### UPDATED: Point to Chrome binary from buildpack
+    # This is the path where the Heroku/Google buildpack installs Chrome
+    options.binary_location = os.environ.get("GOOGLE_CHROME_BIN", "/app/.google-chrome/bin/google-chrome")
+
     driver = None
     new_jobs_found = 0
     
     try:
-        driver = webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(service=service, options=options) 
         driver.get(JOBRAPIDO_URL)
 
         job_card_selector = (By.CSS_SELECTOR, ".job-card_container__-e_fR")
@@ -122,7 +134,6 @@ def scrape_jobrapido_task():
         if driver:
             driver.quit()
 
-# ### NEW ###
 def scrape_unstop_task():
     """
     Scraper for Unstop. Uses their internal API (no Selenium needed).
@@ -130,19 +141,22 @@ def scrape_unstop_task():
     logging.info("[SCRAPER-Unstop] Starting new job scrape...")
     new_jobs_found = 0
 
+    # ### UPDATED: Add Referer and Origin headers to fix 403 error
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': 'https://unstop.com/jobs',
+        'Origin': 'https://unstop.com'
     }
-    # This payload tells the API we just want "jobs"
+    
     payload = {
         "opportunity_type": "jobs",
         "page": 1,
-        "per_page": 25  # Get 25 jobs
+        "per_page": 25
     }
     
     try:
         response = requests.post(UNSTOP_API_URL, headers=headers, json=payload, timeout=10)
-        response.raise_for_status()  # Raise error if status is not 200
+        response.raise_for_status() # Raise error if status is not 200
         data = response.json()
         
         jobs_list = data.get('data', {}).get('data', [])
@@ -185,8 +199,6 @@ def post_job_task():
     This function runs every 2 minutes, fetches ONE unposted job from the DB,
     and posts it to Telegram.
     """
-    # ### UPDATED ###
-    # Read tokens from environment variables every time
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     
@@ -208,7 +220,6 @@ def post_job_task():
 
     logging.info(f"[POSTER] Found job to post: {job['job_title']}")
 
-    # Format the message (Title, Company, Link)
     message = f"📢 **New Job Posting!**\n\n"
     message += f"**Title:** {job['job_title']}\n"
     message += f"**Company:** {job['company_name']}\n\n"
@@ -239,32 +250,19 @@ def run_in_parallel(job_func):
     job_thread = threading.Thread(target=job_func)
     job_thread.start()
 
-# ### NEW ###
 def run_all_scrapers():
     """Run all scraper functions in parallel threads."""
     logging.info("Starting all scrapers...")
     run_in_parallel(scrape_jobrapido_task)
     run_in_parallel(scrape_unstop_task)
 
-def main():
-    # ### UPDATED ###
-    # Check for environment variables at startup
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.critical("CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables not set. Exiting.")
-        return
-        
-    # 1. Setup the database on start
-    setup_database()
-    
-    logging.info("Starting schedulers...")
-    
-    # 2. Define the schedules
-    schedule.every(1).hour.do(run_all_scrapers)  # ### UPDATED ###
+# ### UPDATED: Main scheduler now runs in a background thread
+def run_agent_tasks():
+    """This function runs the scheduler loop in the background."""
+    logging.info("Starting scheduler loop in background thread...")
+    schedule.every(1).hour.do(run_all_scrapers)
     schedule.every(2).minutes.do(run_in_parallel, post_job_task)
 
-    # 3. Run the main loop
-    logging.info("Agent is now running. Press Ctrl+C to stop.")
-    
     # Run scrapers immediately on start
     run_all_scrapers() 
     
@@ -272,12 +270,29 @@ def main():
         try:
             schedule.run_pending()
             time.sleep(1)
-        except KeyboardInterrupt:
-            logging.info("Shutting down agent...")
-            break
         except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            time.sleep(10)
+            logging.error(f"Scheduler loop error: {e}")
+            time.sleep(10) # wait 10s on critical error
+
+@app.route('/')
+def health_check():
+    """This is the endpoint for Uptime Robot."""
+    return "Agent is alive and running.", 200
 
 if __name__ == "__main__":
-    main()
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.critical("CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables not set. Exiting.")
+    else:
+        # 1. Setup the database
+        setup_database()
+        
+        # 2. Start the background scheduler thread
+        logging.info("Starting background agent thread...")
+        agent_thread = Thread(target=run_agent_tasks, daemon=True)
+        agent_thread.start()
+
+        # 3. Start the Flask web server (for Uptime Robot)
+        logging.info("Starting Flask web server...")
+        # Render provides the PORT env var
+        port = int(os.environ.get("PORT", 8080)) 
+        app.run(host='0.0.0.0', port=port)
